@@ -8,12 +8,12 @@ from firebase_admin import firestore
 from datetime import datetime
 
 class FloorController:
-    def __init__(self, name, setpoint=30):
+    def __init__(self, name, setpoint=22):
         self.name = name
         self.setpoint = setpoint
         self.tolerance = 0.5  # ±0.5°C tolerance
         self.last_action_time = 0
-        self.min_action_interval = 300  # 5 minutes between actions
+        self.min_action_interval = 30  # 30 seconds between actions
 
     def get_actions(self, current_temp):
         if current_temp is None:
@@ -41,8 +41,8 @@ class DollhouseSystem:
 
         # Initialize floor controllers
         self.controllers = {
-            'top_floor': FloorController('Top Floor', setpoint=30),
-            'ground_floor': FloorController('Ground Floor', setpoint=30)
+            'top_floor': FloorController('Top Floor', setpoint=22),
+            'ground_floor': FloorController('Ground Floor', setpoint=22)
         }
 
         # Initialize sensors
@@ -60,7 +60,7 @@ class DollhouseSystem:
         GPIO.setmode(GPIO.BCM)
         self.setup_gpio()
 
-        self.logging_interval = 300  # 5 minutes
+        self.logging_interval = 30  # 30 seconds
 
     def setup_gpio(self):
         # Setup bulb relay pins
@@ -166,15 +166,19 @@ class DollhouseSystem:
 
     def run(self):
         print("Starting Automated Dollhouse Control System...")
-        print("Temperature setpoint: 30°C for both floors")
+        print("Temperature setpoint: 22°C for both floors")
         print(f"Logging interval: {self.logging_interval / 60} minutes")
 
-        last_log_time = time.time()
+        readings = self.read_sensors()
+        print("Initial readings:", readings)
+        self.log_to_firebase(readings, datetime.now()) 
+        last_log_time = time.time() 
 
         try:
             while True:
                 current_time = time.time()
                 readings = self.read_sensors()
+                print("readings",readings)
 
                 for location in ['top_floor', 'ground_floor']:
                     if location in readings and readings[location]:
