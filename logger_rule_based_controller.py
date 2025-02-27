@@ -9,10 +9,10 @@ from datetime import datetime
 
 
 class FloorController:
-    def __init__(self, name, setpoint=22):
+    def __init__(self, name, setpoint=32):
         self.name = name
         self.setpoint = setpoint
-        self.tolerance = 0.5  # ±0.5°C tolerance
+        self.tolerance = 0  #
         self.last_action_time = 0
         self.min_action_interval = 30  # 30 seconds between actions
 
@@ -45,8 +45,8 @@ class DollhouseSystem:
 
         # Initialize floor controllers
         self.controllers = {
-            "top_floor": FloorController("Top Floor", setpoint=22),
-            "ground_floor": FloorController("Ground Floor", setpoint=22),
+            "top_floor": FloorController("Top Floor", setpoint=32),
+            "ground_floor": FloorController("Ground Floor", setpoint=32),
         }
 
         # Initialize sensors
@@ -89,13 +89,17 @@ class DollhouseSystem:
             return
 
         servo = self.servos[location]
-        angle = 90 if should_open else 0
-        duty = angle / 18 + 2
+        current_angle = 90 if self.window_states[location] else 0
+        target_angle = 90 if should_open else 0
 
-        servo.ChangeDutyCycle(duty)
-        time.sleep(0.5)
-        servo.ChangeDutyCycle(0)  # Stop pulse
+        step = 1 if target_angle > current_angle else -1
 
+        for angle in range(current_angle, target_angle + step, step):
+            duty = angle / 18 + 2
+            servo.ChangeDutyCycle(duty)
+            time.sleep(0.05)  # Gradual transition
+
+        servo.ChangeDutyCycle(0)  # Stop pulse to avoid jitter
         self.window_states[location] = should_open
         print(f"{location} window {'opened' if should_open else 'closed'}")
 
@@ -175,7 +179,7 @@ class DollhouseSystem:
 
     def run(self):
         print("Starting Automated Dollhouse Control System...")
-        print("Temperature setpoint: 22°C for both floors")
+        print("Temperature setpoint: 32°C for both floors")
         print(f"Logging interval: {self.logging_interval / 60} minutes")
 
         readings = self.read_sensors()
