@@ -14,19 +14,41 @@ from collections import deque
 # Import Stable Baselines and our modules
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from train_sindy_model import train_sindy_model
+import gymnasium as gym
+
+
+class DummyEnv(gym.Env):
+    """
+    A minimal dummy environment for VecNormalize loading.
+    This is only used to load normalization parameters, not for actual simulation.
+    """
+    def __init__(self):
+        # Define observation space to match your training environment
+        self.observation_space = gym.spaces.Box(
+            low=np.array([-10.0, -10.0, -30.0, 0, 0, 0, 0, 10.0, 10.0, 0.0, 0]),
+            high=np.array([50.0, 50.0, 50.0, 1, 1, 1, 1, 35.0, 35.0, 23.0, 2880]),
+            dtype=np.float32,
+        )
+        
+        # Define action space
+        self.action_space = gym.spaces.MultiDiscrete([2, 2, 2, 2])
+        
+    def reset(self, **kwargs):
+        return np.zeros(11, dtype=np.float32), {}
+    
+    def step(self, action):
+        return np.zeros(11, dtype=np.float32), 0.0, False, False, {}
 
 
 class RealDollhousePPOController:
     def __init__(
-        self, model_path, data_file, vec_normalize_path=None, env_params_path=None
+        self, model_path, vec_normalize_path=None, env_params_path=None
     ):
         """
         Initialize the real dollhouse PPO controller.
 
         Args:
             model_path: Path to the trained PPO model
-            data_file: Path to data file for training SINDy model
             vec_normalize_path: Path to VecNormalize parameters (optional)
             env_params_path: Path to environment parameters (optional)
         """
@@ -41,11 +63,6 @@ class RealDollhousePPOController:
         # Load environment parameters
         self.load_environment_params(env_params_path)
 
-        # Train SINDy model
-        print("Training SINDy model for state estimation...")
-        self.sindy_model = train_sindy_model(file_path=data_file)
-        print("SINDy model training completed")
-
         # Load PPO model and normalization
         print(f"Loading PPO model from {model_path}...")
         self.ppo_model = PPO.load(model_path)
@@ -54,12 +71,17 @@ class RealDollhousePPOController:
         self.vec_normalize = None
         if vec_normalize_path and os.path.exists(vec_normalize_path):
             print(f"Loading normalization parameters from {vec_normalize_path}")
-            # Create dummy environment for VecNormalize
-            dummy_env = DummyVecEnv([lambda: None])
-            self.vec_normalize = VecNormalize.load(vec_normalize_path, dummy_env)
-            self.vec_normalize.training = False
-            self.vec_normalize.norm_reward = False
-            print("Normalization loaded successfully")
+            try:
+                # Create a proper dummy environment for VecNormalize
+                dummy_env = DummyVecEnv([lambda: DummyEnv()])
+                self.vec_normalize = VecNormalize.load(vec_normalize_path, dummy_env)
+                self.vec_normalize.training = False
+                self.vec_normalize.norm_reward = False
+                print("Normalization loaded successfully")
+            except Exception as e:
+                print(f"⚠️  Warning: Could not load normalization: {e}")
+                print("Proceeding without normalization")
+                self.vec_normalize = None
 
         # Temperature safety limits
         self.min_safe_temp = 15.0  # Minimum safe temperature (°C)
@@ -79,7 +101,7 @@ class RealDollhousePPOController:
         }  # False = closed
         self.bulb_states = {"top_floor": False, "ground_floor": False}  # False = off
 
-        # Control history for SINDy model (need previous states)
+        # Control history for reference (not needed without SINDy)
         self.temp_history = {
             "ground_floor": deque(maxlen=3),
             "top_floor": deque(maxlen=3),
@@ -201,7 +223,7 @@ class RealDollhousePPOController:
         return readings
 
     def update_temperature_history(self, readings):
-        """Update temperature history for SINDy model."""
+        """Update temperature history for reference."""
         for location in ["ground_floor", "top_floor", "external"]:
             if location in readings and readings[location]:
                 temp = readings[location]["temperature"]
@@ -274,6 +296,7 @@ class RealDollhousePPOController:
         try:
             # Apply normalization if available
             if self.vec_normalize:
+                # Use the normalization directly on the observation
                 normalized_obs = self.vec_normalize.normalize_obs(
                     observation.reshape(1, -1)
                 )
@@ -292,6 +315,8 @@ class RealDollhousePPOController:
 
         except Exception as e:
             print(f"❌ Error getting PPO action: {e}")
+            import traceback
+            traceback.print_exc()
             # Return safe default action (all off/closed)
             return [0, 0, 0, 0]
 
@@ -347,56 +372,67 @@ class RealDollhousePPOController:
     def log_to_firebase(self, readings, action, reward, observation, timestamp):
         """Log all data to Firebase real_time_control collection."""
         try:
-            # Prepare comprehensive data
+            # Helper function to convert numpy types to native Python types
+            def convert_value(value):
+                if value is None:
+                    return None
+                if isinstance(value, (np.integer, np.floating)):
+                    return value.item()  # Converts numpy scalar to Python scalar
+                if isinstance(value, np.ndarray):
+                    return value.tolist()  # Convert arrays to lists
+                if isinstance(value, bool):
+                    return bool(value)  # Ensure it's Python bool, not numpy bool
+                return value
+
+            # Prepare comprehensive data with type conversion
             data = {
                 # Timestamp and episode info
                 "timestamp": timestamp,
                 "episode_start_time": self.episode_start_time,
-                "step_count": self.step_count,
-                "total_reward": self.total_reward,
+                "step_count": convert_value(self.step_count),
+                "total_reward": convert_value(self.total_reward),
+                
                 # Sensor readings
-                "externalTemperature": readings.get("external", {}).get("temperature"),
-                "externalHumidity": readings.get("external", {}).get("humidity"),
-                "topFloorTemperature": readings.get("top_floor", {}).get("temperature"),
-                "topFloorHumidity": readings.get("top_floor", {}).get("humidity"),
-                "groundFloorTemperature": readings.get("ground_floor", {}).get(
-                    "temperature"
-                ),
-                "groundFloorHumidity": readings.get("ground_floor", {}).get("humidity"),
+                "externalTemperature": convert_value(readings.get("external", {}).get("temperature")),
+                "externalHumidity": convert_value(readings.get("external", {}).get("humidity")),
+                "topFloorTemperature": convert_value(readings.get("top_floor", {}).get("temperature")),
+                "topFloorHumidity": convert_value(readings.get("top_floor", {}).get("humidity")),
+                "groundFloorTemperature": convert_value(readings.get("ground_floor", {}).get("temperature")),
+                "groundFloorHumidity": convert_value(readings.get("ground_floor", {}).get("humidity")),
+                
                 # PPO actions (what the model decided)
-                "ppoGroundLightAction": int(action[0]),
-                "ppoGroundWindowAction": int(action[1]),
-                "ppoTopLightAction": int(action[2]),
-                "ppoTopWindowAction": int(action[3]),
+                "ppoGroundLightAction": convert_value(action[0]),
+                "ppoGroundWindowAction": convert_value(action[1]),
+                "ppoTopLightAction": convert_value(action[2]),
+                "ppoTopWindowAction": convert_value(action[3]),
+                
                 # Actual device states (after safety override)
-                "topFloorBulbStatus": self.bulb_states.get("top_floor", False),
-                "groundFloorBulbStatus": self.bulb_states.get("ground_floor", False),
-                "topFloorWindowStatus": self.window_states.get("top_floor", False),
-                "groundFloorWindowStatus": self.window_states.get(
-                    "ground_floor", False
-                ),
+                "topFloorBulbStatus": convert_value(self.bulb_states.get("top_floor", False)),
+                "groundFloorBulbStatus": convert_value(self.bulb_states.get("ground_floor", False)),
+                "topFloorWindowStatus": convert_value(self.window_states.get("top_floor", False)),
+                "groundFloorWindowStatus": convert_value(self.window_states.get("ground_floor", False)),
+                
                 # Setpoints and control parameters
-                "heatingSetpoint": float(observation[7]),
-                "coolingSetpoint": float(observation[8]),
-                "hourOfDay": float(observation[9]),
+                "heatingSetpoint": convert_value(observation[7]),
+                "coolingSetpoint": convert_value(observation[8]),
+                "hourOfDay": convert_value(observation[9]),
+                
                 # Performance metrics
-                "stepReward": reward,
-                "groundComfortViolation": max(0, observation[7] - observation[0])
-                + max(0, observation[0] - observation[8]),
-                "topComfortViolation": max(0, observation[7] - observation[1])
-                + max(0, observation[1] - observation[8]),
-                "energyUse": int(action[0] + action[2]),
+                "stepReward": convert_value(reward),
+                "groundComfortViolation": convert_value(max(0, observation[7] - observation[0]) + max(0, observation[0] - observation[8])),
+                "topComfortViolation": convert_value(max(0, observation[7] - observation[1]) + max(0, observation[1] - observation[8])),
+                "energyUse": convert_value(action[0] + action[2]),
+                
                 # Derived features for analysis
-                "avgTemp": (observation[0] + observation[1]) / 2,
-                "tempDifference": observation[1] - observation[0],
-                "avgSetpoint": (observation[7] + observation[8]) / 2,
-                "groundTempDeviation": observation[0]
-                - (observation[7] + observation[8]) / 2,
-                "topTempDeviation": observation[1]
-                - (observation[7] + observation[8]) / 2,
+                "avgTemp": convert_value((observation[0] + observation[1]) / 2),
+                "tempDifference": convert_value(observation[1] - observation[0]),
+                "avgSetpoint": convert_value((observation[7] + observation[8]) / 2),
+                "groundTempDeviation": convert_value(observation[0] - (observation[7] + observation[8]) / 2),
+                "topTempDeviation": convert_value(observation[1] - (observation[7] + observation[8]) / 2),
+                
                 # Model info
                 "controllerType": "ppo_model",
-                "useNormalization": self.vec_normalize is not None,
+                "useNormalization": convert_value(self.vec_normalize is not None),
                 "setpointPattern": self.setpoint_pattern,
                 "rewardType": self.reward_type,
             }
@@ -407,6 +443,8 @@ class RealDollhousePPOController:
 
         except Exception as e:
             print(f"❌ Error logging to Firebase: {e}")
+            import traceback
+            traceback.print_exc()  # This will help debug any remaining issues
 
     def print_status(self, readings, action, reward, observation):
         """Print current system status."""
@@ -453,6 +491,7 @@ class RealDollhousePPOController:
         print(f"   Step Reward  : {reward:6.3f}")
         print(f"   Total Reward : {self.total_reward:6.3f}")
         print(f"   Avg Reward   : {self.total_reward/max(1, self.step_count):6.3f}")
+        print(f"   Normalization: {'Yes' if self.vec_normalize else 'No'}")
 
         print(f"{'='*60}")
 
@@ -563,9 +602,6 @@ def main():
 
     parser = argparse.ArgumentParser(description="Real Dollhouse PPO Control")
     parser.add_argument("--model-path", required=True, help="Path to trained PPO model")
-    parser.add_argument(
-        "--data-file", required=True, help="Path to data file for SINDy model"
-    )
     parser.add_argument("--vec-normalize-path", help="Path to VecNormalize parameters")
     parser.add_argument("--env-params", help="Path to environment parameters JSON")
     parser.add_argument("--duration", type=float, default=24, help="Duration in hours")
@@ -576,7 +612,6 @@ def main():
         # Create controller
         controller = RealDollhousePPOController(
             model_path=args.model_path,
-            data_file=args.data_file,
             vec_normalize_path=args.vec_normalize_path,
             env_params_path=args.env_params,
         )
@@ -596,9 +631,8 @@ if __name__ == "__main__":
 
 
 # Example usage:
-# python real_dollhouse_ppo_control.py \
-#   --model-path "results/ppo_20250623_134204/logs/models/ppo_final_model.zip" \
-#   --data-file "../Data/dollhouse-data-2025-03-24.csv" \
-#   --vec-normalize-path "results/ppo_20250623_134204/logs/models/vec_normalize.pkl" \
-#   --env-params "results/ppo_20250623_134204/env_params.json" \
-#   --duration 12
+# python RL_Controller.py \
+#   --model-path "Controllers/PPO/ppo_final_model.zip" \
+#   --vec-normalize-path "Controllers/PPO/vec_normalize.pkl" \
+#   --env-params "Controllers/PPO/env_params.json" \
+#   --duration 2
